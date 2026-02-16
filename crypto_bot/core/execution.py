@@ -260,7 +260,8 @@ class ExecutionEngine:
     def get_stats(self) -> dict:
         """Return summary statistics for the session."""
         if not self.trade_history:
-            return {"trades": 0, "capital": self.capital}
+            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+                    "total_pnl": 0.0, "profit_factor": 0.0, "capital": self.capital}
 
         trades = self.trade_history
         wins = [t for t in trades if t.pnl_usd > 0]
