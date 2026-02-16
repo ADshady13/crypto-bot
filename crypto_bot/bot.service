@@ -1,0 +1,31 @@
+[Unit]
+Description=CryptoBot Dual-Core XGBoost Trading Daemon
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cryptobot
+Group=cryptobot
+WorkingDirectory=/opt/crypto_bot
+Environment="PATH=/opt/crypto_bot/venv/bin:/usr/bin"
+EnvironmentFile=/opt/crypto_bot/.env
+ExecStart=/opt/crypto_bot/venv/bin/python main.py --mode live --pair BTCUSDT
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/crypto_bot/data /opt/crypto_bot/logs /opt/crypto_bot/models
+PrivateTmp=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto_bot
+
+[Install]
+WantedBy=multi-user.target

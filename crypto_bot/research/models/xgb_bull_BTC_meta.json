@@ -1,0 +1,1 @@
+{"features": ["roc", "roc_4h", "roc_24h", "roc_72h", "roc_zscore", "fear_greed_value", "fg_normalized", "fg_zscore", "funding_rate", "funding_zscore", "funding_delta_4h", "funding_delta_24h", "ema_200_dist", "adx", "atr", "atr_pct", "atr_pct_zscore", "volume_zscore", "volume_delta_4h", "volume_ratio_24h", "sentiment_score", "sentiment_raw"], "target": "target", "pair": "BTC"}

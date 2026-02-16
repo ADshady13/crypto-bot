@@ -1,0 +1,102 @@
+# Crypto Sentiment Bot - Deployment Configuration
+
+strategy:
+  name: "Derivatives Sentiment Bot"
+  version: "1.0"
+  description: "Long-only strategy using derivatives sentiment to predict spot movements"
+
+# Trading Pairs - SOL & XRP (proven performers)
+pairs:
+  - symbol: "SOLUSDT"
+    enabled: true
+    base_currency: "SOL"
+    quote_currency: "USDT"
+    params:
+      sentiment_entry_threshold: 0.6
+      sentiment_exit_threshold: 0.2
+      funding_zscore_entry: -1.0
+      lsr_zscore_entry: -0.5
+      atr_sl_multiplier: 1.0
+      atr_tp_multiplier: 3.0
+
+  - symbol: "XRPUSDT"
+    enabled: true
+    base_currency: "XRP"
+    quote_currency: "USDT"
+    params:
+      sentiment_entry_threshold: 0.7
+      sentiment_exit_threshold: 0.2
+      funding_zscore_entry: -0.5
+      lsr_zscore_entry: 0.0
+      atr_sl_multiplier: 1.0
+      atr_tp_multiplier: 3.0
+
+# Execution Settings
+execution:
+  # Modes: paper, live
+  mode: "paper"
+  
+  # How often to check for signals (in minutes)
+  check_interval_minutes: 60
+  
+  # Percentage of capital to use per trade
+  trade_size_pct: 0.95
+  
+  # Wait time after a trade before checking again (minutes)
+  cooldown_minutes: 30
+
+# Risk Management
+risk:
+  # Stop trading if daily loss exceeds this %
+  max_daily_loss_pct: 10
+  
+  # Maximum % of capital in a single position
+  max_position_pct: 95
+  
+  # Hard stop loss % (applied to entry price)
+  stop_loss_pct: 3
+  
+  # Maximum open positions across all pairs
+  max_open_positions: 2
+  
+  # Emergency stop - pause bot if drawdown exceeds this %
+  emergency_drawdown_pct: 20
+
+# Binance Configuration
+binance:
+  # API keys loaded from environment variables
+  api_key_env: "BINANCE_API_KEY"
+  secret_env: "BINANCE_SECRET"
+  
+  # Testnet for paper trading
+  testnet: true
+  
+  # Default capital per pair (USDT)
+  default_capital: 100
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/bot.log"
+  console: true
+  
+# Alerts (optional)
+alerts:
+  enabled: false
+  telegram:
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id: ""
+  discord:
+    webhook_url: ""
+
+# Data Settings
+data:
+  # Timeframe for OHLCV
+  timeframe: "1h"
+  
+  # How many candles to fetch
+  lookback_candles: 100
+  
+  # Cache data locally
+  cache_enabled: true
+  cache_dir: "data"
