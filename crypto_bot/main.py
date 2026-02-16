@@ -112,29 +112,44 @@ class TradingBot:
             f"Capital=${self.engine.capital:,.2f}"
         )
 
-        # 6. Execute
-        if signal_action == "FLAT" and self.engine.position:
+        # 6. Execute & Notify
+        # Construct status message components
+        probs_str = f"Bull: {bull_prob:.2f} | Bear: {bear_prob:.2f}"
+        
+        # Scenario 1: FLAT (No Position) -> Periodic Update
+        if signal_action == "FLAT" and not self.engine.position:
+            # Send hourly heartbeat for "No Trade"
+            self.notifier.send(f"⏳ [{self.pair}] FLAT | {probs_str} | Price: ${current_price:,.2f}")
+
+        # Scenario 2: FLAT (Holding Position) -> Close (Exit Signal)
+        elif signal_action == "FLAT" and self.engine.position:
             result = self.engine.close_position(current_price, "SIGNAL")
             if result:
                 self.notifier.trade_alert(
                     "CLOSE", self.pair, current_price,
-                    f"PnL: ${result.pnl_usd:+,.2f} ({result.pnl_pct:+.2f}%)"
+                    f"PnL: ${result.pnl_usd:+,.2f} ({result.pnl_pct:+.2f}%) | {probs_str}"
                 )
 
+        # Scenario 3: LONG/SHORT Signal
         elif signal_action in ("LONG", "SHORT"):
+            # If reversing (e.g. LONG -> SHORT)
             if self.engine.position and self.engine.position.direction != signal_action:
                 result = self.engine.close_position(current_price, "REVERSAL")
                 if result:
                     self.notifier.trade_alert(
                         "REVERSAL", self.pair, current_price,
-                        f"Closed {result.direction}, PnL: ${result.pnl_usd:+,.2f}"
+                        f"Closed {result.direction} | PnL: ${result.pnl_usd:+,.2f} | {probs_str}"
                     )
 
+            # Open new position
             if not self.engine.position:
                 pos = self.engine.open_position(signal_action, current_price)
                 if pos:
-                    reason = f"Bull={bull_prob:.3f} Bear={bear_prob:.3f}"
-                    self.notifier.trade_alert(signal_action, self.pair, current_price, reason)
+                    self.notifier.trade_alert(signal_action, self.pair, current_price, probs_str)
+            
+            # If already holding same direction (e.g. LONG -> LONG) -> Periodic Update
+            elif self.engine.position and self.engine.position.direction == signal_action:
+                self.notifier.send(f"✊ [{self.pair}] HOLD {signal_action} | {probs_str} | Price: ${current_price:,.2f}")
 
     def run(self):
         """Main trading loop — runs until shutdown_event is set."""
