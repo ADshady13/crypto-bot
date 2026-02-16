@@ -10,7 +10,7 @@ Group=cryptobot
 WorkingDirectory=/opt/crypto_bot
 Environment="PATH=/opt/crypto_bot/venv/bin:/usr/bin"
 EnvironmentFile=/opt/crypto_bot/.env
-ExecStart=/opt/crypto_bot/venv/bin/python main.py --mode live --pair BTCUSDT
+ExecStart=/opt/crypto_bot/venv/bin/python main.py --mode paper --pairs "BTCUSDT:50000,SOLUSDT:50000"
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
