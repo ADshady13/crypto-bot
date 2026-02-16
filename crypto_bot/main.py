@@ -147,11 +147,18 @@ class TradingBot:
                 logger.error(f"[{self.pair}] Tick error: {e}", exc_info=True)
                 self.notifier.send(f"⚠️ Error in {self.pair}: {e}")
 
-            # Wait for next tick — check shutdown_event every 10s for fast exits
-            remaining = Config.CHECK_INTERVAL_SECONDS
-            while remaining > 0 and not shutdown_event.is_set():
-                time.sleep(min(remaining, 10))
-                remaining -= 10
+            # Wait until next hour + 60s buffer (e.g. 7:01 PM)
+            now = time.time()
+            next_hour = ((int(now) // 3600) + 1) * 3600
+            sleep_duration = next_hour - now + 60  # 60s buffer for candle close
+            
+            logger.info(f"[{self.pair}] Sleeping {sleep_duration:.0f}s until next hour + 1m...")
+            
+            # Sleep in chunks to allow fast shutdown
+            while sleep_duration > 0 and not shutdown_event.is_set():
+                chunk = min(sleep_duration, 10)
+                time.sleep(chunk)
+                sleep_duration -= chunk
 
         # Graceful shutdown
         logger.info(f"[{self.pair}] Shutting down...")
