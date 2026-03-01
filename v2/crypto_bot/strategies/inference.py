@@ -89,8 +89,8 @@ class ModelLoader:
         # Feature engineering
         df_feat = self.feature_engineer.transform(df_window.copy(), verbose=False)
         
-        # If this isn't BTC, and we have BTC features provided, inject them as macros
-        if pair != "BTCUSDT" and btc_features is not None:
+        # All models (including BTC itself) were trained with the merged Macro features
+        if btc_features is not None:
              df_feat = self.feature_engineer.add_macro_features(df_feat, btc_features)
 
         # Extract features for the LAST row only

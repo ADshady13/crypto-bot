@@ -220,6 +220,14 @@ Realistic simulation leveraging **Trailing Exits** (1.0 ATR activation, 0.5 ATR 
 | **Trailing Stop** | **0.5 ATR Pullback** | Locks in profits aggressively during strong trends. Prevents a winning trade from becoming a loser. |
 | **Chop Filter** | **Time model** | Vetoes entries if the market is paralyzed sideways. |
 
+### Virtual Ledgers vs Live Binance Wallet
+The `PortfolioManager` operates a **Virtual Ledger** locally on the VPS to mimic isolation while interacting with Binance's unified USDⓈ-M margin pool.
+1. **Isolation:** Each of the 5 coins is assigned a virtual `₹10,000` starting balance in Python memory. 
+2. **Execution:** If a model signals a trade, its Kelly Criterion scaling formula looks *only* at its virtual wallet. It sends the raw USD order size to Binance via the API.
+3. **Settlement:** When the trade closes, the localized bot queries the exact realized PnL and adds/subtracts it *only* to its own virtual ledger.
+
+This strictly prevents **Margin Hogging** (one winning coin cannibalizing the entire portfolio's buying power) and **Margin Rescuing** (cross-margin pulling funds from winners to keep losers afloat), simulating 5 physically distinct accounts within a single API key.
+
 ---
 
 ## Indian Tax Compliance & Fees
