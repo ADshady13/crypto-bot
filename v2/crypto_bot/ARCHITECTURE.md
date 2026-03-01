@@ -59,14 +59,7 @@ crypto_bot/
 │
 ├── strategies/                  ← THE BRAIN
 │   ├── feature_engineering.py   ← SINGLE SOURCE OF TRUTH for features (34 features)
-│   └── inference.py             ← Hot-reloading ModelLoader
-│
-├── scripts/                     ← UTILITIES
-│   └── download_clean_data.py   ← Fetch 20K candles + funding + F&G from APIs
-│
-├── jobs/                        ← CRON TASKS
-│   └── retrain.py               ← Champion vs Challenger pipeline
-│
+│   └── inference.py             ← Static ModelLoader (loads all at boot)
 ├── models/                      ← ARTIFACTS (gitignored)
 │   ├── xgb_bull_{PAIR}.json     ← Active Bull model
 │   ├── xgb_bear_{PAIR}.json     ← Active Bear model
@@ -280,12 +273,6 @@ python main.py --mode paper --pair BTCUSDT
 
 # Live trading
 python main.py --mode live --pair SOLUSDT
-
-# Custom capital for paper trading
-python main.py --mode paper --pair ETHUSDT --capital 50000
-
-# Retrain a single pair
-python main.py --retrain --pair BTCUSDT
 
 # Retrain all pairs
 python main.py --retrain --all

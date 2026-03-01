@@ -286,6 +286,9 @@ class PortfolioManager:
         self.state_file = os.path.join(Config.LOG_DIR, f"active_state_{mode}.json")
         self.trade_log_file = os.path.join(Config.LOG_DIR, "trades.csv")
         
+        # Tracks trades executed during the current hourly tick (reset each cycle)
+        self.tick_trades: list[TradeResult] = []
+        
         self._recover_state()
         
     def _recover_state(self):
@@ -313,9 +316,10 @@ class PortfolioManager:
                 json.dump(states, f, indent=4)
 
     def log_trade(self, result: TradeResult):
-        """Append closed trade to the permanent CSV ledger."""
-        df = pd.DataFrame([result.to_csv_dict()])
+        """Append closed trade to the permanent CSV ledger and track for Telegram."""
+        self.tick_trades.append(result)
         
+        df = pd.DataFrame([result.to_csv_dict()])
         write_header = not os.path.exists(self.trade_log_file)
         df.to_csv(self.trade_log_file, mode="a", index=False, header=write_header)
 
@@ -324,36 +328,62 @@ class PortfolioManager:
         total_pnl = 0.0
         portfolio_val = 0.0
         
-        msg_lines = []
+        # ── SECTION 1: Executed Trades (this tick) ──
+        trade_lines = []
+        if self.tick_trades:
+            trade_lines.append("📋 EXECUTED TRADES")
+            trade_lines.append("─" * 24)
+            for t in self.tick_trades:
+                emoji = "✅" if t.pnl_usd >= 0 else "❌"
+                trade_lines.append(
+                    f"{emoji} {t.pair} {t.direction} → {t.exit_reason}\n"
+                    f"   Entry: ${t.entry_price:,.2f} → Exit: ${t.exit_price:,.2f}\n"
+                    f"   Staked: ₹{t.size_usd:,.0f} | PnL: ₹{t.pnl_usd:+,.0f} ({t.pnl_pct:+.2f}%)\n"
+                    f"   Held: {t.duration_h}h | Fee: ₹{t.fee_usd:,.0f}"
+                )
+            trade_lines.append("")
+        
+        # ── SECTION 2: Per-Ledger Status ──
+        ledger_lines = []
+        ledger_lines.append("📒 ISOLATED LEDGERS")
+        ledger_lines.append("─" * 24)
         
         for p in self.pairs:
             bot = self.bots[p]
             cap_diff = bot.capital - 10000.0
             total_pnl += cap_diff
             portfolio_val += bot.capital
-            
             pnl_pct = (cap_diff / 10000.0) * 100
             
-            # Format the output logic
             if bot.position:
                 direction = bot.position.direction
                 emoji = "🟢" if direction == "LONG" else "🔴"
+                hours_held = bot.position.hold_hours
                 
-                # Calculate active PnL approximation loosely
-                # (For real time string formatting only, not actual settlement)
-                msg_lines.append(f"{emoji} {p}: HOLDING {direction} (Entry: ${bot.position.entry_price:,.2f})")
-                msg_lines.append(f"   ↳ Trail SL: ${bot.position.sl_price:,.2f}")
-                msg_lines.append(f"   ↳ Wallet: ₹{bot.capital:,.0f} [Net PnL: {pnl_pct:+.2f}%]")
+                ledger_lines.append(f"{emoji} {p}: ₹{bot.capital:,.0f} ({pnl_pct:+.1f}%)")
+                ledger_lines.append(f"   📌 OPEN {direction} @ ${bot.position.entry_price:,.2f} | Staked: ₹{bot.position.size_usd:,.0f}")
+                ledger_lines.append(f"   ↳ SL: ${bot.position.sl_price:,.2f} | Held: {hours_held}h/{Config.MAX_HOLD_HOURS}h")
+                if bot.position.active_trailing:
+                    ledger_lines.append(f"   ↳ 🔒 Trailing ACTIVE (MFE: ${bot.position.mfe_price:,.2f})")
             else:
-                msg_lines.append(f"⚪ {p}: FLAT")
-                msg_lines.append(f"   ↳ Wallet: ₹{bot.capital:,.0f} [Net PnL: {pnl_pct:+.2f}%]")
-                
-            msg_lines.append("") # Margin
-            
+                ledger_lines.append(f"⚪ {p}: ₹{bot.capital:,.0f} ({pnl_pct:+.1f}%)")
+                ledger_lines.append(f"   No open position")
+            ledger_lines.append("")
+        
+        # ── HEADER ──
         tax_impact = total_pnl * 0.70 if total_pnl > 0 else total_pnl
         
-        header = f"📊 CryptoBot V2 - Hourly Update\n"
-        header += f"💰 Global Portfolio: ₹{portfolio_val:,.0f} (+₹{total_pnl:+,.0f} Gross)\n"
-        header += f"💸 Est Net Profit (after 30% tax): ₹{tax_impact:+,.0f}\n\n"
+        header = f"📊 CryptoBot V2 — Hourly Update\n"
+        header += f"💰 Portfolio: ₹{portfolio_val:,.0f} (₹{total_pnl:+,.0f} Gross)\n"
+        header += f"💸 Est Net (after 30% tax): ₹{tax_impact:+,.0f}\n\n"
         
-        return header + "\n".join(msg_lines)
+        # Combine all sections
+        body = ""
+        if trade_lines:
+            body += "\n".join(trade_lines) + "\n"
+        body += "\n".join(ledger_lines)
+        
+        # Reset tick trades for next cycle
+        self.tick_trades = []
+        
+        return header + body
