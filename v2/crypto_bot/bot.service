@@ -7,10 +7,10 @@ Wants=network-online.target
 Type=simple
 User=cryptobot
 Group=cryptobot
-WorkingDirectory=/opt/crypto_bot/crypto_bot
+WorkingDirectory=/opt/crypto_bot
 Environment="PATH=/opt/crypto_bot/venv/bin:/usr/bin"
-EnvironmentFile=/opt/crypto_bot/crypto_bot/.env
-ExecStart=/opt/crypto_bot/venv/bin/python main.py --mode paper --pairs "BTCUSDT:50000,SOLUSDT:50000"
+EnvironmentFile=/opt/crypto_bot/.env
+ExecStart=/opt/crypto_bot/venv/bin/python main.py --mode paper --pairs "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
@@ -19,7 +19,7 @@ StartLimitIntervalSec=300
 # Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/crypto_bot/crypto_bot/data /opt/crypto_bot/crypto_bot/logs /opt/crypto_bot/crypto_bot/models
+ReadWritePaths=/opt/crypto_bot/data /opt/crypto_bot/logs /opt/crypto_bot/models
 PrivateTmp=yes
 
 # Logging

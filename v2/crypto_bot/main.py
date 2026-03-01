@@ -112,8 +112,8 @@ class GlobalRunner:
             # --- 2b. Evaluate ML Models for New/Reversal Signals ---
             window = dm.get_feature_window(lookback=500)
             
-            # Inject BTC features explicitly if this isn't BTC
-            bull_prob, bear_prob, time_prob = self.model_loader.predict(window, pair, btc_features if pair != "BTCUSDT" else None)
+            # Inject BTC features explicitly
+            bull_prob, bear_prob, time_prob = self.model_loader.predict(window, pair, btc_features)
             
             action = bot.evaluate_signal(current_price, atr_val, bull_prob, bear_prob, time_prob)
             logger.info(f"[{pair}] B:{bull_prob:.2f} R:{bear_prob:.2f} T:{time_prob:.2f} -> {action}")
