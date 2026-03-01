@@ -1,19 +1,14 @@
 """
-Inference — Hot-Reloading ModelLoader for Dual-Core XGBoost.
+Inference — Static ModelLoader for V3 Triple-Core XGBoost.
 
-The ModelLoader monitors the model files on disk and automatically
-reloads them if retrain.py has promoted a new Champion. This enables
-zero-downtime model updates.
-
-Mechanism:
-  - Stores self.last_modified_time for each model file
-  - Before every prediction, checks os.path.getmtime(model_path)
-  - If timestamp changed → reload the Booster immediately
+Models are loaded once on startup. Hot-reloading has been removed
+per V3 architectural guidelines. If models need retraining, the bot
+must be restarted manually.
 """
 
 import os
 import logging
-from typing import Optional
+from typing import Optional, Dict
 
 import numpy as np
 from xgboost import XGBClassifier
@@ -26,157 +21,93 @@ logger = logging.getLogger("crypto_bot")
 
 class ModelLoader:
     """
-    Hot-reloading Dual-Core model manager.
-
-    Loads Bull and Bear XGBoost models per pair, automatically
-    detects when retrain.py has updated them on disk, and reloads
-    without requiring a bot restart.
+    Static Triple-Core model manager.
+    Loads Bull, Bear, and Time XGBoost models per pair on initialization.
     """
 
-    def __init__(self, pair: str):
-        self.pair = pair
-        self.bull_path = os.path.join(Config.MODEL_DIR, f"xgb_bull_{pair}.json")
-        self.bear_path = os.path.join(Config.MODEL_DIR, f"xgb_bear_{pair}.json")
-
-        self.bull_model: Optional[XGBClassifier] = None
-        self.bear_model: Optional[XGBClassifier] = None
-
-        self.bull_mtime: float = 0.0
-        self.bear_mtime: float = 0.0
-
+    def __init__(self, pairs: list[str]):
+        """
+        Args:
+            pairs: List of trading pairs (e.g. ["BTCUSDT", "ETHUSDT", ...])
+        """
+        self.pairs = pairs
+        self.models: Dict[str, Dict[str, XGBClassifier]] = {p: {} for p in pairs}
         self.feature_engineer = FeatureEngineer()
+        
+        # Load all models for all pairs immediately
+        self._load_all_models()
 
-        # Initial load
-        self._load_bull()
-        self._load_bear()
+    def _load_all_models(self):
+        """Load all three models (bull, bear, time) for every configured pair."""
+        for pair in self.pairs:
+            sym = pair.replace("USDT", "")
+            
+            for target in ["bull", "bear", "time"]:
+                path = os.path.join(Config.MODEL_DIR, f"xgb_{target}_{sym}.json")
+                if not os.path.exists(path):
+                    logger.warning(f"Model not found: {path}")
+                    continue
+                
+                try:
+                    model = XGBClassifier()
+                    model.load_model(path)
+                    self.models[pair][target] = model
+                except Exception as e:
+                    logger.error(f"Failed to load {target} model for {pair}: {e}")
+                    
+            loaded_count = len(self.models[pair])
+            if loaded_count == 3:
+                logger.info(f"✅ All 3 models loaded for {pair}")
+            else:
+                logger.error(f"❌ Only {loaded_count}/3 models loaded for {pair}")
 
-    @property
-    def ready(self) -> bool:
-        """True if both models are loaded and ready for inference."""
-        return self.bull_model is not None and self.bear_model is not None
 
-    # ------------------------------------------------------------------ #
-    #  Model Loading
-    # ------------------------------------------------------------------ #
-    def _load_bull(self):
-        """Load or reload the Bull model."""
-        if not os.path.exists(self.bull_path):
-            logger.warning(f"Bull model not found: {self.bull_path}")
-            return
-
-        try:
-            model = XGBClassifier()
-            model.load_model(self.bull_path)
-            self.bull_model = model
-            self.bull_mtime = os.path.getmtime(self.bull_path)
-            logger.info(f"Bull model loaded: {self.bull_path} (mtime={self.bull_mtime:.0f})")
-        except Exception as e:
-            logger.error(f"Failed to load Bull model: {e}")
-
-    def _load_bear(self):
-        """Load or reload the Bear model."""
-        if not os.path.exists(self.bear_path):
-            logger.warning(f"Bear model not found: {self.bear_path}")
-            return
-
-        try:
-            model = XGBClassifier()
-            model.load_model(self.bear_path)
-            self.bear_model = model
-            self.bear_mtime = os.path.getmtime(self.bear_path)
-            logger.info(f"Bear model loaded: {self.bear_path} (mtime={self.bear_mtime:.0f})")
-        except Exception as e:
-            logger.error(f"Failed to load Bear model: {e}")
-
-    # ------------------------------------------------------------------ #
-    #  Hot-Reload Check
-    # ------------------------------------------------------------------ #
-    def _check_reload(self):
-        """
-        Check if model files have been updated on disk.
-        If retrain.py promoted a new Champion, the mtime will differ.
-        """
-        reloaded = False
-
-        if os.path.exists(self.bull_path):
-            current_mtime = os.path.getmtime(self.bull_path)
-            if current_mtime != self.bull_mtime:
-                logger.info("🔄 Bull model changed on disk — hot-reloading...")
-                self._load_bull()
-                reloaded = True
-
-        if os.path.exists(self.bear_path):
-            current_mtime = os.path.getmtime(self.bear_path)
-            if current_mtime != self.bear_mtime:
-                logger.info("🔄 Bear model changed on disk — hot-reloading...")
-                self._load_bear()
-                reloaded = True
-
-        if reloaded:
-            logger.info("✅ Models hot-reloaded successfully")
+    def is_ready(self, pair: str) -> bool:
+        """True if all 3 models are loaded and ready for inference for a given pair."""
+        return len(self.models.get(pair, {})) == 3
 
     # ------------------------------------------------------------------ #
     #  Prediction
     # ------------------------------------------------------------------ #
-    def predict(self, df_window) -> tuple:
+    def predict(self, df_window, pair: str, btc_features=None) -> tuple:
         """
-        Generate Bull and Bear probabilities for the latest data point.
+        Generate Bull, Bear, and Time probabilities for the latest data point.
 
         Args:
             df_window: DataFrame with at least 200 rows of OHLCV + indicators
+            pair: The symbol being predicted (e.g. "ETHUSDT")
+            btc_features: Globally computed BTC features specifically passed in for the new Macro setup
 
         Returns:
-            (bull_prob, bear_prob) — probabilities in [0, 1]
-            Returns (0.5, 0.5) if models aren't ready (neutral → FLAT signal)
+            (bull_prob, bear_prob, time_prob) — probabilities in [0, 1]
+            Returns (0.0, 0.0, 1.0) if models aren't ready (neutral → FLAT signal forced by chop)
         """
-        # Hot-reload check — runs before every prediction
-        self._check_reload()
-
-        if not self.ready:
-            logger.warning("Models not ready — returning neutral (0.5, 0.5)")
-            return 0.5, 0.5
+        if not self.is_ready(pair):
+            logger.warning(f"Models not ready for {pair} — returning neutral (0, 0, 1)")
+            return 0.0, 0.0, 1.0
 
         # Feature engineering
         df_feat = self.feature_engineer.transform(df_window.copy(), verbose=False)
+        
+        # If this isn't BTC, and we have BTC features provided, inject them as macros
+        if pair != "BTCUSDT" and btc_features is not None:
+             df_feat = self.feature_engineer.add_macro_features(df_feat, btc_features)
 
         # Extract features for the LAST row only
         available = [f for f in SHIELD_FEATURES if f in df_feat.columns]
         X = df_feat[available].fillna(0).values[-1:, :]  # Shape: (1, n_features)
 
         try:
-            bull_prob = float(self.bull_model.predict_proba(X)[:, 1][0])
-            bear_prob = float(self.bear_model.predict_proba(X)[:, 1][0])
+            m_bull = self.models[pair]["bull"]
+            m_bear = self.models[pair]["bear"]
+            m_time = self.models[pair]["time"]
+            
+            bull_prob = float(m_bull.predict_proba(X)[:, 1][0])
+            bear_prob = float(m_bear.predict_proba(X)[:, 1][0])
+            time_prob = float(m_time.predict_proba(X)[:, 1][0])
         except Exception as e:
-            logger.error(f"Prediction failed: {e}")
-            return 0.5, 0.5
+            logger.error(f"Prediction failed for {pair}: {e}")
+            return 0.0, 0.0, 1.0
 
-        logger.debug(f"Prediction: Bull={bull_prob:.3f} Bear={bear_prob:.3f}")
-        return bull_prob, bear_prob
-
-    def predict_batch(self, df) -> tuple:
-        """
-        Generate Bull and Bear probability arrays for the entire DataFrame.
-        Used by retrain.py for backtesting.
-
-        Returns:
-            (bull_probs, bear_probs) — numpy arrays
-        """
-        self._check_reload()
-
-        if not self.ready:
-            n = len(df)
-            return np.full(n, 0.5), np.full(n, 0.5)
-
-        df_feat = self.feature_engineer.transform(df.copy(), verbose=False)
-        available = [f for f in SHIELD_FEATURES if f in df_feat.columns]
-        X = df_feat[available].fillna(0).values
-
-        try:
-            bull_probs = self.bull_model.predict_proba(X)[:, 1]
-            bear_probs = self.bear_model.predict_proba(X)[:, 1]
-        except Exception as e:
-            logger.error(f"Batch prediction failed: {e}")
-            n = len(df)
-            return np.full(n, 0.5), np.full(n, 0.5)
-
-        return bull_probs, bear_probs
+        logger.debug(f"[{pair}] Preds: Bull={bull_prob:.3f} Bear={bear_prob:.3f} Chop={time_prob:.3f}")
+        return bull_prob, bear_prob, time_prob

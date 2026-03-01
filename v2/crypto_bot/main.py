@@ -1,17 +1,13 @@
 """
-Crypto Bot — Dual-Core XGBoost Trading System
+Crypto Bot — V3 Triple-Core XGBoost System
 
 Single CLI entry point for the production trading bot.
 
 Usage:
-    python main.py --mode paper --pair BTCUSDT                    # Single pair
-    python main.py --mode paper --pairs BTCUSDT:50000,SOLUSDT:50000  # Multi-pair
-    python main.py --mode paper --all --capital 100000            # All pairs (equal split)
-    python main.py --retrain --all                                # Retrain all models
+    python main.py --mode paper --pairs "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT"
 
-Multi-pair mode runs each pair in its own thread with individual capital
-allocations. They share the same Binance API connection but track PnL
-and positions independently.
+The PortfolioManager controls isolated 10K INR wallets internally for each pair.
+All API state logic, signal computations, and trade execution occur strictly sequentially to avoid rate limits and permit a single consolidated hourly Telegram ping.
 """
 
 import argparse
@@ -20,7 +16,6 @@ import signal
 import sys
 import time
 import os
-import threading
 
 # Ensure crypto_bot is on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,36 +23,36 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.config import Config
 from core.logging_setup import setup_logging
 from core.data_manager import DataManager
-from core.execution import ExecutionEngine
+from core.execution import PortfolioManager
 from core.notification import Notifier
 from strategies.inference import ModelLoader
 
 logger = logging.getLogger("crypto_bot")
 
-# Global shutdown flag (shared across all threads)
-shutdown_event = threading.Event()
+# Global shutdown flag
+shutdown_event = False
 
+class GlobalRunner:
+    """Synchronous runner for the entire 5-pair crypto portfolio."""
 
-class TradingBot:
-    """Trading bot for a single pair. Multiple instances run concurrently."""
-
-    def __init__(self, pair: str, mode: str, capital: float):
-        self.pair = pair
+    def __init__(self, pairs: list[str], mode: str):
+        self.pairs = pairs
         self.mode = mode
-        self.capital = capital
 
-        # Components
-        self.data_manager = DataManager(pair)
-        pair_short = pair.replace("USDT", "")
-        self.model_loader = ModelLoader(pair_short)
-        self.engine = ExecutionEngine(pair, mode)
+        # Global Components
         self.notifier = Notifier()
+        self.portfolio = PortfolioManager(pairs, mode)
+        
+        # Load all static machine learning models once
+        self.model_loader = ModelLoader(pairs)
+        
+        # Isolated Data Managers
+        self.data_managers = {p: DataManager(p) for p in pairs}
 
     def initialize(self):
-        """Load historical data and set up the engine."""
-        logger.info(f"[{self.pair}] Initializing in {self.mode} mode...")
+        """Load historical continuous cache for all pairs."""
+        logger.info(f"Initializing V3 Portfolio in {self.mode.upper()} mode...")
 
-        # Validate config for live mode
         if self.mode == "live":
             errors = Config.validate()
             if errors:
@@ -65,195 +60,119 @@ class TradingBot:
                     logger.error(f"Config error: {e}")
                 return False
 
-        # Load historical data
-        self.data_manager.load_historical()
+        # Load historical cache for feature engineering warmth
+        for p, dm in self.data_managers.items():
+            dm.load_historical()
+            if not self.model_loader.is_ready(p):
+                logger.error(f"Missing models for {p}. Aborting.")
+                return False
 
-        # Check model readiness
-        if not self.model_loader.ready:
-            logger.error(f"[{self.pair}] Models not ready! Run: python -m jobs.retrain --pair {self.pair}")
-            return False
-
-        # Set capital
-        self.engine.set_capital(self.capital)
-        logger.info(f"✅ [{self.pair}] Initialized | {self.mode} | ${self.capital:,.0f}")
-        self.notifier.send(f"🤖 Bot started: {self.pair} ({self.mode}) — ${self.capital:,.0f}")
+        logger.info(f"✅ Portfolio initialized. 10,000 INR isolated wallets provisioned for {len(self.pairs)} pairs.")
+        self.notifier.send(f"🤖 V3 Portfolio Boot: Monitoring {len(self.pairs)} pairs in {self.mode.upper()} mode with Trailing Exits.")
         return True
 
-    def tick(self):
-        """Run one trading cycle."""
-        # 1. Update data
-        df = self.data_manager.update()
-        if df.empty or len(df) < 250:
-            logger.warning(f"[{self.pair}] Not enough data, skipping tick")
-            return
-
-        # 2. Get current price
-        current_price = float(df["Close"].iloc[-1])
-
-        # 3. Check stop loss first
-        sl_result = self.engine.check_stop_loss(current_price)
-        if sl_result:
-            self.notifier.trade_alert(
-                "STOP_LOSS", self.pair, sl_result.exit_price,
-                f"PnL: ${sl_result.pnl_usd:+,.2f}"
-            )
-            return
-
-        # 4. Get ML predictions (hot-reload aware)
-        window = self.data_manager.get_feature_window(lookback=500)
-        bull_prob, bear_prob = self.model_loader.predict(window)
-
-        # 5. Evaluate signal
-        signal_action = self.engine.evaluate_signal(bull_prob, bear_prob)
-
-        logger.info(
-            f"[{self.pair}] @ ${current_price:,.2f} | "
-            f"Bull={bull_prob:.3f} Bear={bear_prob:.3f} → {signal_action} | "
-            f"Capital=${self.engine.capital:,.2f}"
-        )
-
-        # 6. Execute & Notify
-        # Construct status message components
-        probs_str = f"Bull: {bull_prob:.2f} | Bear: {bear_prob:.2f}"
+    def run_portfolio_tick(self):
+        """Runs the sequential cycle exactly on the hour rollover."""
+        logger.info("--- Hourly Portfolio Tick Initiated ---")
         
-        # Scenario 1: FLAT (No Position) -> Periodic Update
-        if signal_action == "FLAT" and not self.engine.position:
-            # Send hourly heartbeat for "No Trade"
-            self.notifier.send(f"⏳ [{self.pair}] FLAT | {probs_str} | Price: ${current_price:,.2f}")
-
-        # Scenario 2: FLAT (Holding Position) -> Close (Exit Signal)
-        elif signal_action == "FLAT" and self.engine.position:
-            result = self.engine.close_position(current_price, "SIGNAL")
-            if result:
-                self.notifier.trade_alert(
-                    "CLOSE", self.pair, current_price,
-                    f"PnL: ${result.pnl_usd:+,.2f} ({result.pnl_pct:+.2f}%) | {probs_str}"
-                )
-
-        # Scenario 3: LONG/SHORT Signal
-        elif signal_action in ("LONG", "SHORT"):
-            # If reversing (e.g. LONG -> SHORT)
-            if self.engine.position and self.engine.position.direction != signal_action:
-                result = self.engine.close_position(current_price, "REVERSAL")
-                if result:
-                    self.notifier.trade_alert(
-                        "REVERSAL", self.pair, current_price,
-                        f"Closed {result.direction} | PnL: ${result.pnl_usd:+,.2f} | {probs_str}"
-                    )
-
-            # Open new position
-            if not self.engine.position:
-                pos = self.engine.open_position(signal_action, current_price)
-                if pos:
-                    self.notifier.trade_alert(signal_action, self.pair, current_price, probs_str)
+        # 1. Fetch BTC Macro data first (REQUIRED for V3 Alts)
+        btc_dm = self.data_managers["BTCUSDT"]
+        btc_raw = btc_dm.update()
+        if btc_raw.empty or len(btc_raw) < 200:
+            logger.warning("BTC Macro data insufficient. Cannot process ticks.")
+            return
             
-            # If already holding same direction (e.g. LONG -> LONG) -> Periodic Update
-            elif self.engine.position and self.engine.position.direction == signal_action:
-                self.notifier.send(f"✊ [{self.pair}] HOLD {signal_action} | {probs_str} | Price: ${current_price:,.2f}")
+        # Extract features for BTC Macro linkage
+        btc_features = self.model_loader.feature_engineer.transform(btc_raw.copy(), verbose=False)
 
-    def run(self):
-        """Main trading loop — runs until shutdown_event is set."""
-        logger.info(f"[{self.pair}] Starting loop (interval: {Config.CHECK_INTERVAL_SECONDS}s)")
+        # 2. Iterate through all bots
+        for pair in self.pairs:
+            bot = self.portfolio.bots[pair]
+            dm = self.data_managers[pair]
+            
+            # Update the individual coin
+            df = dm.update()
+            if df.empty or len(df) < 250:
+                logger.warning(f"[{pair}] Insufficient data, skipping tick")
+                continue
+                
+            current_price = float(df["Close"].iloc[-1])
+            high = float(df["High"].iloc[-1])
+            low = float(df["Low"].iloc[-1])
+            
+            # We need the ATR at this very moment to update our Trailing logic mathematically
+            # Rather than calculating all features, we just grab the last ATR
+            atr_val = self.model_loader.feature_engineer.atr(df["High"], df["Low"], df["Close"], Config.ATR_PERIOD).iloc[-1] if hasattr(Config, "ATR_PERIOD") else 0.0
+            
+            # --- 2a. Tick Open Positions (Stop Losses / Trailing Stops / Timeouts) ---
+            exit_result = bot.process_tick_updates(current_price, high, low)
+            if exit_result:
+                self.portfolio.log_trade(exit_result)
+                
+            # --- 2b. Evaluate ML Models for New/Reversal Signals ---
+            window = dm.get_feature_window(lookback=500)
+            
+            # Inject BTC features explicitly if this isn't BTC
+            bull_prob, bear_prob, time_prob = self.model_loader.predict(window, pair, btc_features if pair != "BTCUSDT" else None)
+            
+            action = bot.evaluate_signal(current_price, atr_val, bull_prob, bear_prob, time_prob)
+            logger.info(f"[{pair}] B:{bull_prob:.2f} R:{bear_prob:.2f} T:{time_prob:.2f} -> {action}")
+            
+            # Stagger Binance API hits slightly
+            time.sleep(1)
 
-        while not shutdown_event.is_set():
+        # 3. Save internal JSON state
+        self.portfolio.save_state()
+
+        # 4. Blast the consolidated Telegram message
+        tg_msg = self.portfolio.generate_telegram_summary()
+        self.notifier.send(tg_msg)
+        
+        logger.info("--- Hourly Portfolio Tick Completed ---")
+
+    def run_forever(self):
+        """Main time-aligned execution loop."""
+        global shutdown_event
+        
+        logger.info(f"Starting V3 Loop (Interval: {Config.CHECK_INTERVAL_SECONDS}s)")
+
+        while not shutdown_event:
             try:
-                self.tick()
+                self.run_portfolio_tick()
             except Exception as e:
-                logger.error(f"[{self.pair}] Tick error: {e}", exc_info=True)
-                self.notifier.send(f"⚠️ Error in {self.pair}: {e}")
+                logger.error(f"Global Tick Error: {e}", exc_info=True)
+                self.notifier.send(f"⚠️ V3 Portfolio Crash Loop Error:\n{e}")
 
-            # Wait until next hour + 60s buffer (e.g. 7:01 PM)
+            # Sleep until the NEXT hour rollover + 30s buffer for Binance candle settling
             now = time.time()
             next_hour = ((int(now) // 3600) + 1) * 3600
-            sleep_duration = next_hour - now + 60  # 60s buffer for candle close
+            sleep_duration = next_hour - now + 30
             
-            logger.info(f"[{self.pair}] Sleeping {sleep_duration:.0f}s until next hour + 1m...")
+            logger.info(f"Sleeping {sleep_duration:.0f}s until next candle close...")
             
-            # Sleep in chunks to allow fast shutdown
-            while sleep_duration > 0 and not shutdown_event.is_set():
+            while sleep_duration > 0 and not shutdown_event:
                 chunk = min(sleep_duration, 10)
                 time.sleep(chunk)
                 sleep_duration -= chunk
 
-        # Graceful shutdown
-        logger.info(f"[{self.pair}] Shutting down...")
-        stats = self.engine.get_stats()
-        logger.info(f"[{self.pair}] Session: {stats}")
-        self.notifier.send(
-            f"🛑 Bot stopped: {self.pair}\n"
-            f"Trades: {stats['trades']} | WR: {stats['win_rate']:.1f}% | "
-            f"PnL: ${stats['total_pnl']:+,.2f}"
-        )
-
-
-def run_bot_thread(pair: str, mode: str, capital: float):
-    """Thread entry point for running a single pair's bot."""
-    bot = TradingBot(pair, mode, capital)
-    if not bot.initialize():
-        logger.error(f"[{pair}] Failed to initialize — thread exiting")
-        return
-    bot.run()
-
-
-def parse_pairs_string(pairs_str: str) -> dict:
-    """
-    Parse --pairs format: 'BTCUSDT:50000,SOLUSDT:50000'
-    Returns {pair: capital} dict.
-    """
-    pairs = {}
-    for entry in pairs_str.split(","):
-        entry = entry.strip()
-        if ":" in entry:
-            pair, cap = entry.split(":", 1)
-            pairs[pair.strip().upper()] = float(cap.strip())
-        else:
-            raise ValueError(
-                f"Invalid pair format: '{entry}'. "
-                f"Use PAIR:CAPITAL format, e.g. 'BTCUSDT:50000,SOLUSDT:50000'"
-            )
-    return pairs
+        logger.info("Graceful Shutdown. Saving finalizing state...")
+        self.portfolio.save_state()
+        self.notifier.send("🛑 CryptoBot V3 Portfolio Engine Offline.")
 
 
 # ======================================================================
 #  CLI ENTRY POINT
 # ======================================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="Crypto Bot — Dual-Core XGBoost Trading System",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py --mode paper --pair BTCUSDT                       # Single pair
-  python main.py --mode paper --pairs BTCUSDT:50000,SOLUSDT:50000  # Multi-pair
-  python main.py --mode paper --all --capital 100000               # All 5 pairs (equal split)
-  python main.py --retrain --pair BTCUSDT                          # Retrain models
-  python main.py --retrain --all                                   # Retrain all
-        """
-    )
+    parser = argparse.ArgumentParser(description="Crypto Bot V3 Portfolio Runner")
 
     parser.add_argument(
         "--mode", choices=["paper", "live"], default="paper",
         help="Trading mode (default: paper)"
     )
     parser.add_argument(
-        "--pair", type=str, default=None,
-        help="Single trading pair (e.g. BTCUSDT)"
-    )
-    parser.add_argument(
-        "--pairs", type=str, default=None,
-        help="Multi-pair with allocations: 'BTCUSDT:50000,SOLUSDT:50000'"
-    )
-    parser.add_argument(
-        "--capital", type=float, default=100_000,
-        help="Capital per pair for --pair, or total for --all (default: 100000)"
-    )
-    parser.add_argument(
-        "--retrain", action="store_true",
-        help="Run model retraining instead of trading"
-    )
-    parser.add_argument(
-        "--all", action="store_true",
-        help="Trade all supported pairs (equal capital split)"
+        "--pairs", type=str, default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT",
+        help="Comma separated list of pairs (e.g. BTCUSDT,ETHUSDT)"
     )
 
     args = parser.parse_args()
@@ -261,97 +180,34 @@ Examples:
     # Setup logging
     setup_logging()
     Config.ensure_dirs()
+    
+    # Needs a default ATR period value for fast access, checking if exists, else append to Config directly on boot
+    if not hasattr(Config, "ATR_PERIOD"):
+        Config.ATR_PERIOD = 14
 
-    # Handle retrain mode
-    if args.retrain:
-        from jobs.retrain import main as retrain_main
-        sys.argv = ["retrain"]
-        if args.all:
-            sys.argv.append("--all")
-        elif args.pair:
-            sys.argv.extend(["--pair", args.pair])
-        retrain_main()
-        return
+    pairs_list = [p.strip().upper() for p in args.pairs.split(",")]
 
-    # ---- Build pair→capital mapping ----
-    ALL_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-
-    if args.pairs:
-        # Explicit multi-pair: --pairs BTCUSDT:50000,SOLUSDT:50000
-        pair_allocations = parse_pairs_string(args.pairs)
-    elif args.all:
-        # All pairs with equal split
-        cap_each = args.capital / len(ALL_PAIRS)
-        pair_allocations = {p: cap_each for p in ALL_PAIRS}
-    elif args.pair:
-        # Single pair
-        pair_allocations = {args.pair: args.capital}
-    else:
-        # Default pair from .env
-        pair_allocations = {Config.DEFAULT_PAIR: args.capital}
-
-    # ---- Banner ----
     logger.info("=" * 60)
-    logger.info("  CRYPTO BOT — Dual-Core XGBoost Trading System")
+    logger.info("  CRYPTO BOT V3 — Portfolio Manager Engine")
     logger.info("=" * 60)
-    logger.info(f"  Mode: {args.mode} | Pairs: {len(pair_allocations)}")
-    for pair, cap in pair_allocations.items():
-        logger.info(f"    {pair}: ${cap:,.0f}")
-    logger.info(f"  Total Capital: ${sum(pair_allocations.values()):,.0f}")
+    logger.info(f"  Mode: {args.mode} | Pairs: {len(pairs_list)}")
     logger.info("=" * 60)
 
-    # ---- Signal handler for graceful shutdown ----
+    # ---- Signal handler ----
     def handle_shutdown(signum, frame):
-        logger.info("Shutdown signal received — stopping all pairs...")
-        shutdown_event.set()
+        global shutdown_event
+        logger.info("Shutdown signal received...")
+        shutdown_event = True
 
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-    # ---- Launch ----
-    if len(pair_allocations) == 1:
-        # Single pair — run in main thread (simpler)
-        pair, cap = next(iter(pair_allocations.items()))
-        bot = TradingBot(pair, args.mode, cap)
-        if not bot.initialize():
-            sys.exit(1)
-        bot.run()
-    else:
-        # Multi-pair — one thread per pair
-        threads = []
-        for pair, cap in pair_allocations.items():
-            t = threading.Thread(
-                target=run_bot_thread,
-                args=(pair, args.mode, cap),
-                name=f"bot-{pair}",
-                daemon=True,
-            )
-            threads.append(t)
-            t.start()
-            time.sleep(2)  # Stagger API calls to avoid rate limits
-
-        logger.info(f"All {len(threads)} pair threads started")
-
-        # Wait for shutdown signal
-        try:
-            while not shutdown_event.is_set():
-                shutdown_event.wait(timeout=60)
-
-                # Log combined status every 60s
-                alive = sum(1 for t in threads if t.is_alive())
-                if alive > 0:
-                    logger.debug(f"Heartbeat: {alive}/{len(threads)} threads alive")
-                else:
-                    logger.warning("All threads dead — exiting")
-                    break
-        except KeyboardInterrupt:
-            shutdown_event.set()
-
-        # Wait for all threads to finish graceful shutdown
-        for t in threads:
-            t.join(timeout=30)
-
-        logger.info("All pair threads stopped. Goodbye.")
+    # Instantiate the monolith runner and go
+    runner = GlobalRunner(pairs_list, args.mode)
+    if not runner.initialize():
+        sys.exit(1)
+        
+    runner.run_forever()
 
 
 if __name__ == "__main__":

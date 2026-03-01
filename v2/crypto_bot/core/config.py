@@ -36,22 +36,26 @@ class Config:
     MODEL_DIR: str = os.path.join(_ROOT, os.getenv("MODEL_DIR", "models"))
     LOG_DIR: str = os.path.join(_ROOT, "logs")
 
-    # --- Strategy Constants (hard-coded for safety) ---
+    # --- Strategy Constants (V3 Dynamic) ---
     LEVERAGE: int = 1               # HARD-CODED: Never > 1x
-    FEE_PCT: float = 0.001          # 0.1% taker fee
-    SLIPPAGE_PCT: float = 0.0005    # 0.05% estimated slippage
-    SL_PCT: float = 0.03            # 3% stop loss
-    FUNDING_INTERVAL_H: int = 8     # Hours between funding payments
+    FEE_PCT: float = 0.0004         # 0.04% taker fee Binance
+    SLIPPAGE_PCT: float = 0.0003    # 0.03% estimated slippage
+    
+    # Trailing Stop Constants
+    SL_ATR_MULT: float = 1.0          # Initial hard stop loss distance
+    TRAILING_ACTIVATION: float = 1.0  # Activate trailing stop when profit hits 1.0×ATR
+    TRAILING_PULLBACK: float = 0.5    # Trail behind MFE by 0.5×ATR
+    MAX_HOLD_HOURS: int = 12
 
-    # --- ML Thresholds (Dual-Core) ---
-    BULL_ENTRY_PROB: float = 0.70   # Bull prob > this → long
-    BEAR_ENTRY_PROB: float = 0.70   # Bear prob > this → short
-    BULL_BLOCK_PROB: float = 0.30   # Bull prob must be < this to allow short
-    BEAR_BLOCK_PROB: float = 0.30   # Bear prob must be < this to allow long
-
-    # --- Retraining ---
-    RETRAIN_TEST_DAYS: int = 30     # Champion vs Challenger test window
-    RETRAIN_MIN_WIN_RATE: float = 55.0
+    # --- ML Thresholds (V3 Macro Optuna Grid) ---
+    # These are the best performing thresholds exactly as evaluated in OOT
+    THRESHOLDS = {
+        "ETHUSDT": {"bull": 0.50, "bear": 0.60, "time": 0.50},
+        "XRPUSDT": {"bull": 0.55, "bear": 0.50, "time": 0.55},
+        "SOLUSDT": {"bull": 0.50, "bear": 0.45, "time": 0.45},
+        "BNBUSDT": {"bull": 0.55, "bear": 0.50, "time": 0.40},
+        "BTCUSDT": {"bull": 0.50, "bear": 0.45, "time": 0.35},
+    }
 
     # --- Polling ---
     CHECK_INTERVAL_SECONDS: int = 3600  # 1 hour
@@ -81,8 +85,7 @@ class Config:
     def summary(cls) -> str:
         """Human-readable config summary (no secrets)."""
         return (
-            f"Mode={cls.TRADE_MODE} | Pair={cls.DEFAULT_PAIR} | "
-            f"Leverage={cls.LEVERAGE}x | SL={cls.SL_PCT*100}% | "
-            f"Bull>{cls.BULL_ENTRY_PROB} Bear>{cls.BEAR_ENTRY_PROB} | "
+            f"Mode={cls.TRADE_MODE} | Leverage={cls.LEVERAGE}x | "
+            f"Trail={cls.TRAILING_ACTIVATION}xATR / {cls.TRAILING_PULLBACK}xATR | "
             f"API={'SET' if cls.BINANCE_API_KEY else 'MISSING'}"
         )

@@ -1,21 +1,23 @@
 """
-Execution Engine — 1x Leverage Order Safety + Position Management.
+Execution Engine — V3 Dynamic Position Management & Trailing Stops.
 
 This module is the ONLY place where trades are executed.
-Safety constraints are hard-coded and cannot be overridden:
-  - LEVERAGE = 1x (always)
-  - STOP LOSS = 3% (always checked)
-  - Position sizing = 95% of available capital (5% buffer for fees)
-
-Supports paper mode (simulated fills) and live mode (Binance API).
+It has been heavily upgraded for V3 to support:
+  - Isolated Portfolios (each bot tracks its own 10,000 INR wallet).
+  - Trailing Chandelier Exits (tracking Max Favorable Excursion).
+  - Consolidated Telegram Notifications.
+  - State Recovery (recovering from a JSON file in Paper mode).
 """
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+import os
+import json
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Dict
 
 import ccxt
+import pandas as pd
 
 from core.config import Config
 
@@ -24,258 +26,334 @@ logger = logging.getLogger("crypto_bot")
 
 @dataclass
 class Position:
-    """Represents an open position."""
+    """Represents an open position with dynamic trailing state."""
     direction: str          # "LONG" or "SHORT"
     entry_price: float
     size_usd: float         # Capital allocated (before fees)
     entry_time: float       # Unix timestamp
     pair: str
-    sl_price: float = 0.0   # Stop loss price
-
-    def __post_init__(self):
-        if self.direction == "LONG":
-            self.sl_price = self.entry_price * (1 - Config.SL_PCT)
-        elif self.direction == "SHORT":
-            self.sl_price = self.entry_price * (1 + Config.SL_PCT)
+    atr_at_entry: float
+    sl_price: float         # Current stop loss (starts at Hard SL, moves via trailing)
+    mfe_price: float        # Max Favorable Excursion (highest high for long, lowest low for short)
+    active_trailing: bool = False
+    hold_hours: int = 0
 
 
 @dataclass
 class TradeResult:
-    """Result of an executed trade."""
+    """Result of an executed trade (Logged to CSV)."""
+    pair: str
     direction: str
+    entry_time: float
+    exit_time: float
     entry_price: float
     exit_price: float
+    size_usd: float
     pnl_usd: float
     pnl_pct: float
-    exit_reason: str        # "SIGNAL", "SL", "MANUAL"
-    pair: str
-    duration_h: float = 0.0
+    fee_usd: float
+    exit_reason: str        # "HARD_SL", "TRAIL_SL", "TIMEOUT", "SIGNAL"
+    duration_h: float
+    mfe_price: float
+
+    def to_csv_dict(self) -> dict:
+        d = asdict(self)
+        d["entry_time_str"] = pd.to_datetime(d["entry_time"], unit='s').strftime('%Y-%m-%d %H:%M:%S')
+        d["exit_time_str"] = pd.to_datetime(d["exit_time"], unit='s').strftime('%Y-%m-%d %H:%M:%S')
+        return d
 
 
-class ExecutionEngine:
+class BotInstance:
     """
-    Manages position entry/exit with hard-coded safety constraints.
-
-    INVARIANTS:
-      - Leverage is ALWAYS 1x (hard-coded, not configurable)
-      - Stop loss is ALWAYS 3% (hard-coded)
-      - Max one position per pair at a time
+    Manages an isolated wallet and position state for a single Pair.
+    Contains isolated Kelly Criterion sizing and trailing logic.
     """
 
-    def __init__(self, pair: str, mode: str = "paper"):
+    def __init__(self, pair: str, mode: str, initial_capital: float = 10000.0):
         self.pair = pair
         self.mode = mode
+        self.capital = initial_capital
         self.position: Optional[Position] = None
-        self.capital: float = 0.0
-        self.trade_history: list[TradeResult] = []
+        
+        # Load specific pair thresholds
+        thresh = Config.THRESHOLDS.get(pair, Config.THRESHOLDS["BTCUSDT"])
+        self.bull_thresh = thresh["bull"]
+        self.bear_thresh = thresh["bear"]
+        self.time_thresh = thresh["time"]
 
-        # Initialize exchange for live mode
-        if mode == "live":
-            self.exchange = ccxt.binance({
-                "apiKey": Config.BINANCE_API_KEY,
-                "secret": Config.BINANCE_SECRET,
-                "enableRateLimit": True,
-                "options": {"defaultType": "future"},
-            })
-            # HARD-CODED: Set leverage to 1x immediately
-            try:
-                self.exchange.set_leverage(1, self.pair)
-                logger.info(f"Leverage set to 1x for {self.pair}")
-            except Exception as e:
-                logger.warning(f"Could not set leverage (may not be futures): {e}")
-        else:
-            self.exchange = None
-            logger.info(f"Paper mode: simulated execution for {self.pair}")
+    def calculate_position_size(self, probability: float, threshold: float) -> float:
+        """Kelly-inspired dynamic allocation directly to the current isolated wallet size."""
+        if probability < threshold:
+            return 0.0
+            
+        # Scale from 50% base up to 100% allocation
+        score = min(1.0, (probability - threshold) / (0.95 - threshold + 0.001))
+        size_pct = 0.50 + (score * 0.50)
+        
+        return self.capital * size_pct
 
-    def set_capital(self, capital: float):
-        """Set available capital for trading."""
-        self.capital = capital
-        logger.info(f"Capital set: ${capital:,.2f}")
+    def get_state_dict(self) -> dict:
+        """Serialize current position for recovery save."""
+        return {
+            "capital": self.capital,
+            "position": asdict(self.position) if self.position else None
+        }
 
-    # ------------------------------------------------------------------ #
-    #  SIGNAL EVALUATION
-    # ------------------------------------------------------------------ #
-    def evaluate_signal(self, bull_prob: float, bear_prob: float) -> str:
+    def restore_state(self, state: dict):
+        """Restore from saved state."""
+        if "capital" in state:
+            self.capital = state["capital"]
+        if "position" in state and state["position"]:
+            self.position = Position(**state["position"])
+
+    def process_tick_updates(self, current_price: float, high: float, low: float) -> Optional[TradeResult]:
         """
-        Evaluate ML probabilities and return action.
-
-        Returns: "LONG", "SHORT", or "FLAT"
+        Process trailing stops, timeouts, and stop losses. 
+        Returns TradeResult if closed, else None.
         """
-        if bull_prob > Config.BULL_ENTRY_PROB and bear_prob < Config.BEAR_BLOCK_PROB:
-            return "LONG"
-        elif bear_prob > Config.BEAR_ENTRY_PROB and bull_prob < Config.BULL_BLOCK_PROB:
-            return "SHORT"
-        return "FLAT"
-
-    # ------------------------------------------------------------------ #
-    #  CHECK STOP LOSS
-    # ------------------------------------------------------------------ #
-    def check_stop_loss(self, current_price: float) -> Optional[TradeResult]:
-        """Check if current price triggers a stop loss."""
-        if self.position is None:
+        if not self.position:
             return None
-
-        triggered = False
-        if self.position.direction == "LONG" and current_price <= self.position.sl_price:
-            triggered = True
-        elif self.position.direction == "SHORT" and current_price >= self.position.sl_price:
-            triggered = True
-
-        if triggered:
-            logger.warning(
-                f"🛑 STOP LOSS HIT: {self.position.direction} {self.pair} "
-                f"@ {current_price:.2f} (SL={self.position.sl_price:.2f})"
-            )
-            return self._close_position(self.position.sl_price, "SL")
+            
+        pos = self.position
+        pos.hold_hours += 1
+        
+        exit_price = None
+        reason = None
+        
+        # --- Trailing Stop Logic ---
+        if pos.direction == "LONG":
+            # Update MFE
+            if high > pos.mfe_price:
+                pos.mfe_price = high
+                
+            profit_distance = pos.mfe_price - pos.entry_price
+            if not pos.active_trailing and profit_distance >= (Config.TRAILING_ACTIVATION * pos.atr_at_entry):
+                pos.active_trailing = True
+                
+            if pos.active_trailing:
+                trail_level = pos.mfe_price - (Config.TRAILING_PULLBACK * pos.atr_at_entry)
+                if trail_level > pos.sl_price:
+                    pos.sl_price = trail_level
+                    
+            if low <= pos.sl_price:
+                exit_price = pos.sl_price * (1 - Config.SLIPPAGE_PCT)
+                reason = "TRAIL_SL" if pos.active_trailing else "HARD_SL"
+            elif pos.hold_hours >= Config.MAX_HOLD_HOURS:
+                exit_price = current_price * (1 - Config.SLIPPAGE_PCT)
+                reason = "TIMEOUT"
+                
+        elif pos.direction == "SHORT":
+            if low < pos.mfe_price:
+                pos.mfe_price = low
+                
+            profit_distance = pos.entry_price - pos.mfe_price
+            if not pos.active_trailing and profit_distance >= (Config.TRAILING_ACTIVATION * pos.atr_at_entry):
+                pos.active_trailing = True
+                
+            if pos.active_trailing:
+                trail_level = pos.mfe_price + (Config.TRAILING_PULLBACK * pos.atr_at_entry)
+                if trail_level < pos.sl_price:
+                    pos.sl_price = trail_level
+                    
+            if high >= pos.sl_price:
+                exit_price = pos.sl_price * (1 + Config.SLIPPAGE_PCT)
+                reason = "TRAIL_SL" if pos.active_trailing else "HARD_SL"
+            elif pos.hold_hours >= Config.MAX_HOLD_HOURS:
+                exit_price = current_price * (1 + Config.SLIPPAGE_PCT)
+                reason = "TIMEOUT"
+                
+        # --- Has Triggered Exit ---
+        if exit_price is not None:
+            return self.close_position(exit_price, reason)
+            
         return None
 
-    # ------------------------------------------------------------------ #
-    #  ENTRY
-    # ------------------------------------------------------------------ #
-    def open_position(self, direction: str, current_price: float) -> Optional[Position]:
+    def evaluate_signal(self, current_price: float, atr: float, bull_prob: float, bear_prob: float, time_prob: float) -> Optional[str]:
         """
-        Open a new position. Applies fees and slippage.
-
-        Returns the Position if opened, None if rejected.
+        Evaluate ML probabilities and return action strings or execute them immediately.
+        Returns the action string ("LONG", "SHORT", "CLOSE", "FLAT") for logging.
         """
-        if self.position is not None:
-            logger.info(f"Already in {self.position.direction} position, skipping entry")
-            return None
+        # 1. Check Chop Filter
+        if time_prob >= self.time_thresh:
+            if self.position:
+                return "HOLD" # We don't close randomly on chop, we just hold and wait
+            return "FLAT"
 
-        if self.capital <= 0:
-            logger.warning("No capital available for entry")
-            return None
+        is_long = bull_prob >= self.bull_thresh
+        is_short = bear_prob >= self.bear_thresh
+        
+        # Conflict Resolution
+        if is_long and is_short:
+            if bull_prob >= bear_prob:
+                is_short = False
+            else:
+                is_long = False
+                
+        # 2. Reversals
+        if self.position:
+            if (self.position.direction == "LONG" and is_short) or \
+               (self.position.direction == "SHORT" and is_long):
+                return "REVERSAL"
+            else:
+                return "HOLD"
+                
+        # 3. New Entry
+        if is_long or is_short:
+            direction = "LONG" if is_long else "SHORT"
+            prob_score = bull_prob if is_long else bear_prob
+            thresh_score = self.bull_thresh if is_long else self.bear_thresh
+            
+            size_usd = self.calculate_position_size(prob_score, thresh_score)
+            
+            if size_usd > 100: # Min trade size
+                self._open_position(direction, current_price, size_usd, atr)
+                return direction
+                
+        return "FLAT"
 
-        # Position sizing: 95% of capital (5% buffer for fees)
-        trade_size = self.capital * 0.95
-        entry_cost = trade_size * (Config.FEE_PCT + Config.SLIPPAGE_PCT)
-        net_size = trade_size - entry_cost
 
-        if self.mode == "live":
-            result = self._execute_live_order(direction, net_size, current_price)
-            if result is None:
-                return None
-
+    def _open_position(self, direction: str, current_price: float, size_usd: float, atr: float):
+        """Simulates internal state update for position open."""
+        # Simulated Slippage
+        entry_price = current_price * (1 + Config.SLIPPAGE_PCT if direction == "LONG" else 1 - Config.SLIPPAGE_PCT)
+        
+        sl_price = entry_price - (Config.SL_ATR_MULT * atr) if direction == "LONG" else entry_price + (Config.SL_ATR_MULT * atr)
+        
         self.position = Position(
             direction=direction,
-            entry_price=current_price,
-            size_usd=net_size,
+            entry_price=entry_price,
+            size_usd=size_usd,
             entry_time=time.time(),
             pair=self.pair,
+            atr_at_entry=atr,
+            sl_price=sl_price,
+            mfe_price=entry_price
         )
-        self.capital -= trade_size
+        logger.info(f"[{self.pair}] OPENED {direction} @ ${entry_price:,.2f} | Size: ${size_usd:,.2f}")
 
-        logger.info(
-            f"{'🟢' if direction == 'LONG' else '🔴'} OPENED {direction} {self.pair} "
-            f"@ ${current_price:,.2f} | Size: ${net_size:,.2f} | "
-            f"SL: ${self.position.sl_price:,.2f}"
-        )
-        return self.position
-
-    # ------------------------------------------------------------------ #
-    #  EXIT
-    # ------------------------------------------------------------------ #
-    def close_position(self, current_price: float, reason: str = "SIGNAL") -> Optional[TradeResult]:
-        """Close the current position at the given price."""
-        if self.position is None:
-            return None
-        return self._close_position(current_price, reason)
-
-    def _close_position(self, exit_price: float, reason: str) -> TradeResult:
-        """Internal: close position and record the trade."""
+    def close_position(self, exit_price: float, reason: str) -> TradeResult:
+        """Closes internal position and applies PnL physically to the isolated wallet."""
         pos = self.position
-        exit_cost = pos.size_usd * (Config.FEE_PCT + Config.SLIPPAGE_PCT)
-
+        
+        # Apply fees via simulated math directly
+        total_fee = pos.size_usd * (Config.FEE_PCT * 2) # Assume entry + exit fee
+        
         if pos.direction == "LONG":
-            pnl_pct = (exit_price / pos.entry_price) - 1
-        else:  # SHORT
-            pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
-
-        pnl_usd = pos.size_usd * pnl_pct - exit_cost
-        duration_h = (time.time() - pos.entry_time) / 3600
-
-        if self.mode == "live":
-            self._execute_live_close(pos.direction, pos.size_usd, exit_price)
-
-        self.capital += pos.size_usd + pnl_usd
-
-        result = TradeResult(
+            raw_pnl_pct = (exit_price - pos.entry_price) / pos.entry_price
+        else:
+            raw_pnl_pct = (pos.entry_price - exit_price) / pos.entry_price
+            
+        raw_pnl_usd = pos.size_usd * raw_pnl_pct
+        net_pnl = raw_pnl_usd - total_fee
+        
+        # Add PnL to isolated wallet
+        self.capital += net_pnl
+        
+        duration_h = pos.hold_hours
+        
+        res = TradeResult(
+            pair=self.pair,
             direction=pos.direction,
+            entry_time=pos.entry_time,
+            exit_time=time.time(),
             entry_price=pos.entry_price,
             exit_price=exit_price,
-            pnl_usd=pnl_usd,
-            pnl_pct=pnl_pct * 100,
+            size_usd=pos.size_usd,
+            pnl_usd=net_pnl,
+            pnl_pct=(net_pnl / pos.size_usd) * 100,
+            fee_usd=total_fee,
             exit_reason=reason,
-            pair=self.pair,
             duration_h=duration_h,
+            mfe_price=pos.mfe_price
         )
-        self.trade_history.append(result)
+        
         self.position = None
+        logger.info(f"[{self.pair}] CLOSED {pos.direction} @ ${exit_price:,.2f} | PnL: ${net_pnl:+,.2f} ({reason})")
+        return res
 
-        emoji = "💰" if pnl_usd > 0 else "💸"
-        logger.info(
-            f"{emoji} CLOSED {result.direction} {self.pair} @ ${exit_price:,.2f} | "
-            f"PnL: ${pnl_usd:+,.2f} ({pnl_pct*100:+.2f}%) | Reason: {reason} | "
-            f"Duration: {duration_h:.1f}h"
-        )
-        return result
 
-    # ------------------------------------------------------------------ #
-    #  LIVE EXECUTION (Binance Futures API)
-    # ------------------------------------------------------------------ #
-    def _execute_live_order(self, direction: str, size_usd: float, price: float) -> Optional[dict]:
-        """Execute a real order on Binance Futures."""
-        try:
-            side = "buy" if direction == "LONG" else "sell"
-            # Calculate quantity from USD size
-            amount = size_usd / price
+class PortfolioManager:
+    """
+    Overarching manager that holds the 5 isolated BotInstances.
+    Is responsible for state recovery, trade logging, and generating the Telegram summary.
+    """
 
-            order = self.exchange.create_market_order(
-                self.pair, side, amount,
-                params={"positionSide": "BOTH"}
-            )
-            logger.info(f"LIVE ORDER executed: {order['id']} {side} {amount:.6f} {self.pair}")
-            return order
-        except Exception as e:
-            logger.error(f"LIVE ORDER FAILED: {e}")
-            return None
+    def __init__(self, pairs: list[str], mode: str = "paper"):
+        self.mode = mode
+        self.pairs = pairs
+        self.bots: Dict[str, BotInstance] = {p: BotInstance(p, mode) for p in pairs}
+        
+        self.state_file = os.path.join(Config.LOG_DIR, f"active_state_{mode}.json")
+        self.trade_log_file = os.path.join(Config.LOG_DIR, "trades.csv")
+        
+        self._recover_state()
+        
+    def _recover_state(self):
+        """Recover Paper/Live position states on restart."""
+        if self.mode == "paper":
+            if os.path.exists(self.state_file):
+                with open(self.state_file, "r") as f:
+                    try:
+                        states = json.load(f)
+                        for pair, state in states.items():
+                            if pair in self.bots:
+                                self.bots[pair].restore_state(state)
+                        logger.info("Successfully recovered Paper state from JSON.")
+                    except Exception as e:
+                        logger.error(f"Failed to parse state file: {e}")
+        else:
+            # LIVE MODE: In a true live deployment, we would connect CCXT here to recreate state.
+            pass
 
-    def _execute_live_close(self, direction: str, size_usd: float, price: float):
-        """Close a real position on Binance Futures."""
-        try:
-            side = "sell" if direction == "LONG" else "buy"
-            amount = size_usd / price
+    def save_state(self):
+        """Save current Paper simulation state to JSON."""
+        if self.mode == "paper":
+            states = {p: b.get_state_dict() for p, b in self.bots.items()}
+            with open(self.state_file, "w") as f:
+                json.dump(states, f, indent=4)
 
-            order = self.exchange.create_market_order(
-                self.pair, side, amount,
-                params={"positionSide": "BOTH", "reduceOnly": True}
-            )
-            logger.info(f"LIVE CLOSE executed: {order['id']}")
-        except Exception as e:
-            logger.error(f"LIVE CLOSE FAILED: {e}")
+    def log_trade(self, result: TradeResult):
+        """Append closed trade to the permanent CSV ledger."""
+        df = pd.DataFrame([result.to_csv_dict()])
+        
+        write_header = not os.path.exists(self.trade_log_file)
+        df.to_csv(self.trade_log_file, mode="a", index=False, header=write_header)
 
-    # ------------------------------------------------------------------ #
-    #  STATS
-    # ------------------------------------------------------------------ #
-    def get_stats(self) -> dict:
-        """Return summary statistics for the session."""
-        if not self.trade_history:
-            return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
-                    "total_pnl": 0.0, "profit_factor": 0.0, "capital": self.capital}
-
-        trades = self.trade_history
-        wins = [t for t in trades if t.pnl_usd > 0]
-        losses = [t for t in trades if t.pnl_usd <= 0]
-
-        gross_profit = sum(t.pnl_usd for t in wins)
-        gross_loss = abs(sum(t.pnl_usd for t in losses))
-
-        return {
-            "trades": len(trades),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": len(wins) / len(trades) * 100 if trades else 0,
-            "total_pnl": sum(t.pnl_usd for t in trades),
-            "profit_factor": gross_profit / gross_loss if gross_loss > 0 else float("inf"),
-            "capital": self.capital,
-        }
+    def generate_telegram_summary(self) -> str:
+        """Create the V3 single compiled Telegram alert message."""
+        total_pnl = 0.0
+        portfolio_val = 0.0
+        
+        msg_lines = []
+        
+        for p in self.pairs:
+            bot = self.bots[p]
+            cap_diff = bot.capital - 10000.0
+            total_pnl += cap_diff
+            portfolio_val += bot.capital
+            
+            pnl_pct = (cap_diff / 10000.0) * 100
+            
+            # Format the output logic
+            if bot.position:
+                direction = bot.position.direction
+                emoji = "🟢" if direction == "LONG" else "🔴"
+                
+                # Calculate active PnL approximation loosely
+                # (For real time string formatting only, not actual settlement)
+                msg_lines.append(f"{emoji} {p}: HOLDING {direction} (Entry: ${bot.position.entry_price:,.2f})")
+                msg_lines.append(f"   ↳ Trail SL: ${bot.position.sl_price:,.2f}")
+                msg_lines.append(f"   ↳ Wallet: ₹{bot.capital:,.0f} [Net PnL: {pnl_pct:+.2f}%]")
+            else:
+                msg_lines.append(f"⚪ {p}: FLAT")
+                msg_lines.append(f"   ↳ Wallet: ₹{bot.capital:,.0f} [Net PnL: {pnl_pct:+.2f}%]")
+                
+            msg_lines.append("") # Margin
+            
+        tax_impact = total_pnl * 0.70 if total_pnl > 0 else total_pnl
+        
+        header = f"📊 CryptoBot V2 - Hourly Update\n"
+        header += f"💰 Global Portfolio: ₹{portfolio_val:,.0f} (+₹{total_pnl:+,.0f} Gross)\n"
+        header += f"💸 Est Net Profit (after 30% tax): ₹{tax_impact:+,.0f}\n\n"
+        
+        return header + "\n".join(msg_lines)
