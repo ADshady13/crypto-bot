@@ -37,5 +37,8 @@ results/
 *.swo
 .ruff_cache/
 
+# Agent Skills
+.agent/skills/
+
 # OS
 .DS_Store
