@@ -79,6 +79,13 @@ SHIELD_FEATURES = [
     "cdl_engulf_bull", # Bullish Engulfing: bull candle fully engulfs prior bear candle
     "cdl_engulf_bear", # Bearish Engulfing: bear candle fully engulfs prior bull candle
     "cdl_body_ratio",  # Body / Total Range — candle conviction (1 = full body, 0 = doji)
+
+    # === V3 MACRO FEATURES (5) ===
+    "btc_roc",           # BTC Momentum
+    "btc_rsi_14",        # BTC RSI
+    "btc_volume_zscore", # BTC Volume Spikes
+    "btc_atr_pct",       # BTC Volatility
+    "btc_ema_200_dist",  # BTC Trend
 ]
 
 
@@ -370,6 +377,31 @@ class FeatureEngineer:
             (c <= prev_o)       # Current close at or below prior open
         ).astype(int)
 
+        return df
+
+    # ================================================================== #
+    #  V3 NEW: Macro BTC Features
+    # ================================================================== #
+    def add_macro_features(self, df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Merge macro BTC features into the current DataFrame safely.
+        btc_df must already have its own features computed.
+        """
+        features_to_extract = ["roc", "rsi_14", "volume_zscore", "atr_pct", "ema_200_dist"]
+        
+        # We only want to join the overlapping timestamps safely
+        macro_subset = btc_df[features_to_extract].copy()
+        
+        # Rename columns to add 'btc_' prefix
+        macro_subset.rename(columns={f: f"btc_{f}" for f in features_to_extract}, inplace=True)
+        
+        # Left join on the timestamp index - zero time leakage because timestamps align perfectly
+        df = df.join(macro_subset, how="left")
+        
+        # If any missing (due to mismatches or start differences), forward-fill then fillna(0)
+        for f in features_to_extract:
+            df[f"btc_{f}"] = df[f"btc_{f}"].ffill().fillna(0)
+            
         return df
 
     # ================================================================== #

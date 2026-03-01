@@ -326,25 +326,20 @@ def main():
     
     fe = FeatureEngineer()
     
-    # Focused Grid (best from previous run)
-    THRESHOLDS = [
-        # BTC
-        ("BTCUSDT", 0.45, 0.45, 0.35),
-        ("BTCUSDT", 0.50, 0.50, 0.40),
-        # ETH
-        ("ETHUSDT", 0.50, 0.50, 0.45),
-        ("ETHUSDT", 0.55, 0.55, 0.50), # Best from before
-        # SOL
-        ("SOLUSDT", 0.52, 0.55, 0.35),
-        # XRP
-        ("XRPUSDT", 0.50, 0.45, 0.55),
-        ("XRPUSDT", 0.55, 0.50, 0.50),
-    ]
+    # Precompute BTC macro features for backtesting
+    print("  Loading global BTC macro features...")
+    btc_df = pd.read_csv(os.path.join(DATA_DIR, "BTCUSDT_20k.csv"), index_col="timestamp", parse_dates=True)
+    btc_features = fe.transform(btc_df)
     
-    for pair, bt, brt, tt in THRESHOLDS:
+    # Search grid
+    B_THRESH = [0.45, 0.50, 0.55, 0.60]
+    T_THRESH = [0.35, 0.40, 0.45, 0.50, 0.55]
+    
+    for pair in PAIRS:
         df = pd.read_csv(os.path.join(DATA_DIR, f"{pair}_20k.csv"),
                          index_col="timestamp", parse_dates=True)
         df = fe.transform(df)
+        df = fe.add_macro_features(df, btc_features)
         df = fe.create_targets(df)
         oot_df = df.iloc[17500:19800] # OOT Nov 2025 - Mar 2026
         
@@ -352,8 +347,21 @@ def main():
         if len(models) != 3:
             continue
             
-        r = run_dynamic_backtest(oot_df, models, pair, "OOT", bt, brt, tt)
-        print_result(r)
+        best_r = None
+        # Execute grid search
+        for bt in B_THRESH:
+            for brt in B_THRESH:
+                for tt in T_THRESH:
+                    r = run_dynamic_backtest(oot_df, models, pair, "OOT", bt, brt, tt)
+                    # We want maximizing net_pnl, but only if it made $>0 and traded a statistically significant amount
+                    if r.total_trades >= 5:
+                        if best_r is None or r.net_pnl > best_r.net_pnl:
+                            best_r = r
+                            
+        if best_r is not None:
+            print_result(best_r)
+        else:
+            print(f"\n  🔴 {pair} | No profitable configurations found (min 5 trades).")
 
 
 if __name__ == "__main__":

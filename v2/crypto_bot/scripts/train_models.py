@@ -55,7 +55,7 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 
 
-def load_and_prepare(pair: str) -> tuple:
+def load_and_prepare(pair: str, btc_features: pd.DataFrame) -> tuple:
     """Load data, compute features and targets, split into train/test/OOT."""
     path = os.path.join(DATA_DIR, f"{pair}_20k.csv")
     df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
@@ -64,6 +64,7 @@ def load_and_prepare(pair: str) -> tuple:
     # Feature engineering
     fe = FeatureEngineer()
     df = fe.transform(df)
+    df = fe.add_macro_features(df, btc_features)
     df = fe.create_targets(df)
 
     # Drop warmup zone (first 200 rows have zero-filled indicators)
@@ -254,13 +255,13 @@ def save_model(model, pair: str, target_name: str, best_params: dict,
     return model_path
 
 
-def train_pair(pair: str) -> list:
+def train_pair(pair: str, btc_features: pd.DataFrame) -> list:
     """Train all 3 models for a single pair."""
     logger.info(f"\n{'='*70}")
     logger.info(f"  TRAINING: {pair}")
     logger.info(f"{'='*70}")
 
-    train_df, test_df, oot_df = load_and_prepare(pair)
+    train_df, test_df, oot_df = load_and_prepare(pair, btc_features)
     results = []
 
     for target_name, target_col in TARGETS.items():
@@ -348,8 +349,15 @@ def main():
     all_results = []
     t_start = time.time()
 
+    # Pre-compute BTC features once for macro indicators
+    logger.info("Computing global BTC macro features...")
+    btc_path = os.path.join(DATA_DIR, "BTCUSDT_20k.csv")
+    btc_raw = pd.read_csv(btc_path, index_col="timestamp", parse_dates=True)
+    fe_btc = FeatureEngineer()
+    btc_features = fe_btc.transform(btc_raw)
+
     for pair in PAIRS:
-        pair_results = train_pair(pair)
+        pair_results = train_pair(pair, btc_features)
         all_results.extend(pair_results)
 
     total_time = time.time() - t_start
